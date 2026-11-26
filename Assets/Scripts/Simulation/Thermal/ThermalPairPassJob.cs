@@ -1,17 +1,22 @@
 using Unity.Burst;
 using Unity.Collections;
-using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
+using Unity.Mathematics;
 
-[BurstCompile]
+[BurstCompile(FloatPrecision.Standard, FloatMode.Fast)]
 public struct ThermalPairPassJob : IJobParallelFor
 {
+    private const float InsulatorFactor = 1f / 255f;
+    private const float MinMassKg = 1e-4f;
+    private const float TempDeadzoneK = 0.01f;
+    private const float MinTempK = 1f;
+    private const float MaxTempK = 10000f;
+
     [ReadOnly] public NativeArray<ElementDef> ElementDefs;
     [ReadOnly] public NativeArray<ushort> ElementIds;
     [ReadOnly] public NativeArray<float> Masses;
 
-    // Each job index owns a disjoint pair; parity guarantees no two indices
-    // write the same cell in the same pass.
+    // 奇偶配对保证同一 Pass 内每个格子只被一个线程读写，完全无锁
     [NativeDisableParallelForRestriction]
     public NativeArray<float> Temperatures;
 
@@ -28,7 +33,6 @@ public struct ThermalPairPassJob : IJobParallelFor
             return;
         }
 
-        int cellCount = Width * Height;
         int lineDivisor = Axis == 0 ? Width - Parity : Height - Parity;
         if (lineDivisor <= 1)
         {
@@ -56,14 +60,15 @@ public struct ThermalPairPassJob : IJobParallelFor
             bIndex = aIndex + Width;
         }
 
-        if (aIndex < 0 || bIndex < 0 || aIndex >= cellCount || bIndex >= cellCount)
+        float mA = Masses[aIndex];
+        float mB = Masses[bIndex];
+        if (mA <= MinMassKg || mB <= MinMassKg)
         {
             return;
         }
 
         ushort idA = ElementIds[aIndex];
         ushort idB = ElementIds[bIndex];
-
         if (idA >= ElementDefs.Length || idB >= ElementDefs.Length)
         {
             return;
@@ -71,30 +76,67 @@ public struct ThermalPairPassJob : IJobParallelFor
 
         ElementDef defA = ElementDefs[idA];
         ElementDef defB = ElementDefs[idB];
-
-        float heatCapacityA = Masses[aIndex] * defA.SHC;
-        float heatCapacityB = Masses[bIndex] * defB.SHC;
-
-        if (heatCapacityA <= 1e-5f || heatCapacityB <= 1e-5f)
+        if (defA.State == (byte)ElementState.Vacuum || defB.State == (byte)ElementState.Vacuum)
         {
             return;
         }
 
-        float conductance = defA.TC < defB.TC ? defA.TC : defB.TC;
-        if (conductance <= 0f)
+        float tA = Temperatures[aIndex];
+        float tB = Temperatures[bIndex];
+        float deltaT = tA - tB;
+
+        if (math.abs(deltaT) < TempDeadzoneK)
         {
             return;
         }
 
-        // Cap the transfer at 45% of the smaller heat capacity so a single
-        // pass can never overshoot equilibrium, regardless of dt or TC.
-        float smallerHeatCapacity = heatCapacityA < heatCapacityB ? heatCapacityA : heatCapacityB;
-        float maxConductance = 0.45f * smallerHeatCapacity / Dt;
-        float effectiveConductance = conductance < maxConductance ? conductance : maxConductance;
+        // 1. 等效热导率 k_eff（对齐《缺氧》：隔热走 min/255，普通走几何平均 * 状态倍率）
+        float kEff;
+        if (defA.IsInsulator == 1 || defB.IsInsulator == 1)
+        {
+            kEff = math.min(defA.TC, defB.TC) * InsulatorFactor;
+        }
+        else
+        {
+            kEff = math.sqrt(defA.TC * defB.TC) * GetStateMultiplier(defA.State, defB.State);
+        }
 
-        float deltaHeat = effectiveConductance * (Temperatures[bIndex] - Temperatures[aIndex]) * Dt;
+        if (kEff <= 0f)
+        {
+            return;
+        }
 
-        Temperatures[aIndex] += deltaHeat / heatCapacityA;
-        Temperatures[bIndex] -= deltaHeat / heatCapacityB;
+        // 2. 统一 DTU 量纲：Mass(kg) * 1000(g/kg) * SHC(DTU/g·K) = 热容(DTU/K)
+        float capA = mA * 1000f * defA.SHC;
+        float capB = mB * 1000f * defB.SHC;
+        if (capA <= 1e-5f || capB <= 1e-5f)
+        {
+            return;
+        }
+
+        // 原始传热量 q (DTU)
+        float q = deltaT * kEff * Dt * 1000f;
+
+        // 3. 防震荡硬截断：单步温变不超过总温差的 1/4 且绝不越过热平衡温度 T_eq
+        float tEq = (capA * tA + capB * tB) / (capA + capB);
+        float maxDeltaTA = math.min(math.abs(tA - tEq), math.abs(deltaT) * 0.25f);
+        float maxDeltaTB = math.min(math.abs(tB - tEq), math.abs(deltaT) * 0.25f);
+        float maxSafeQ = math.min(maxDeltaTA * capA, maxDeltaTB * capB);
+
+        q = math.clamp(q, -maxSafeQ, maxSafeQ);
+
+        // 4. 严格能量守恒写回（开尔文）
+        Temperatures[aIndex] = math.clamp(tA - q / capA, MinTempK, MaxTempK);
+        Temperatures[bIndex] = math.clamp(tB + q / capB, MinTempK, MaxTempK);
+    }
+
+    private static float GetStateMultiplier(byte a, byte b)
+    {
+        if (a == (byte)ElementState.Solid && b == (byte)ElementState.Solid) return 1.0f;
+        if (a == (byte)ElementState.Liquid && b == (byte)ElementState.Liquid) return 625.0f;
+        if (a == (byte)ElementState.Gas && b == (byte)ElementState.Gas) return 25.0f;
+        if ((a == (byte)ElementState.Solid && b == (byte)ElementState.Gas) ||
+            (a == (byte)ElementState.Gas && b == (byte)ElementState.Solid)) return 25.0f;
+        return 1.0f; // 固-液、气-液（对齐《缺氧》原版）
     }
 }

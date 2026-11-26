@@ -6,10 +6,21 @@ public sealed class ThermalConductionPass : ISimPass
     {
         JobHandle handle = dependency;
 
-        handle = ScheduleAxisPass(grid, dt, 0, 0, handle);
-        handle = ScheduleAxisPass(grid, dt, 0, 1, handle);
-        handle = ScheduleAxisPass(grid, dt, 1, 0, handle);
-        handle = ScheduleAxisPass(grid, dt, 1, 1, handle);
+        // 偶数 Tick 正序、奇数 Tick 逆序，抵消 4-Pass 串行带来的微小方向偏置
+        if ((tickIndex & 1) == 0)
+        {
+            handle = ScheduleAxisPass(grid, dt, 0, 0, handle); // 横偶
+            handle = ScheduleAxisPass(grid, dt, 0, 1, handle); // 横奇
+            handle = ScheduleAxisPass(grid, dt, 1, 0, handle); // 纵偶
+            handle = ScheduleAxisPass(grid, dt, 1, 1, handle); // 纵奇
+        }
+        else
+        {
+            handle = ScheduleAxisPass(grid, dt, 1, 1, handle); // 纵奇
+            handle = ScheduleAxisPass(grid, dt, 1, 0, handle); // 纵偶
+            handle = ScheduleAxisPass(grid, dt, 0, 1, handle); // 横奇
+            handle = ScheduleAxisPass(grid, dt, 0, 0, handle); // 横偶
+        }
 
         return handle;
     }

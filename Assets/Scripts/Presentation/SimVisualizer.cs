@@ -1,25 +1,30 @@
+using Unity.Collections;
 using UnityEngine;
 
 public enum SimOverlayMode
 {
-    Temperature,
-    Material,
-    Mass
+    Temperature = 0,
+    Material = 1,
+    Mass = 2
 }
 
 public sealed class SimVisualizer : MonoBehaviour
 {
     [SerializeField] private Shader heatmapShader;
     [SerializeField] private float minTempC = -20f;
-    [SerializeField] private float maxTempC = 80f;
+    [SerializeField] private float maxTempC = 100f;
     [SerializeField] private SimOverlayMode overlayMode = SimOverlayMode.Temperature;
 
     private SimGridData _grid;
     private Texture2D _texture;
-    private float[] _scalars;
     private Material _material;
     private Mesh _mesh;
     private MeshRenderer _renderer;
+
+    private static readonly int ScalarTexId = Shader.PropertyToID("_ScalarTex");
+    private static readonly int ModeId = Shader.PropertyToID("_Mode");
+    private static readonly int MinTempKId = Shader.PropertyToID("_MinTempK");
+    private static readonly int MaxTempKId = Shader.PropertyToID("_MaxTempK");
 
     public SimOverlayMode Mode
     {
@@ -42,7 +47,6 @@ public sealed class SimVisualizer : MonoBehaviour
     public void Initialize(SimGridData grid)
     {
         _grid = grid;
-        _scalars = new float[grid.CellCount];
 
         _texture = new Texture2D(grid.Width, grid.Height, TextureFormat.RFloat, false, true)
         {
@@ -50,8 +54,6 @@ public sealed class SimVisualizer : MonoBehaviour
             filterMode = FilterMode.Point,
             wrapMode = TextureWrapMode.Clamp
         };
-        _texture.SetPixelData(_scalars, 0);
-        _texture.Apply(false, false);
 
         Shader shader = heatmapShader != null ? heatmapShader : Shader.Find("XNotInclude/ThermalHeatmap");
         if (shader == null)
@@ -61,7 +63,7 @@ public sealed class SimVisualizer : MonoBehaviour
         }
 
         _material = new Material(shader) { name = "SimHeatmapMaterial" };
-        _material.SetTexture("_ScalarTex", _texture);
+        _material.SetTexture(ScalarTexId, _texture);
 
         _mesh = BuildQuad(grid.Width, grid.Height);
 
@@ -79,76 +81,56 @@ public sealed class SimVisualizer : MonoBehaviour
 
     public void Refresh()
     {
-        if (_grid == null || _texture == null || _scalars == null)
+        if (_grid == null || _texture == null)
         {
             return;
         }
 
+        NativeArray<float> raw = _texture.GetRawTextureData<float>();
+
         switch (overlayMode)
         {
             case SimOverlayMode.Temperature:
-            {
-                float invRange = 1f / Mathf.Max(0.001f, maxTempC - minTempC);
-                for (int i = 0; i < _scalars.Length; i++)
-                {
-                    _scalars[i] = (_grid.Temperatures[i] - minTempC) * invRange;
-                }
+                // 零 GC 直接整块拷贝到纹理显存缓冲，归一化交给 GPU Shader
+                raw.CopyFrom(_grid.Temperatures);
                 break;
-            }
+
             case SimOverlayMode.Material:
-            {
-                for (int i = 0; i < _scalars.Length; i++)
+                for (int i = 0; i < raw.Length; i++)
                 {
-                    _scalars[i] = _grid.ElementIds[i] / 16f;
+                    raw[i] = _grid.ElementIds[i];
                 }
                 break;
-            }
+
             case SimOverlayMode.Mass:
-            {
-                for (int i = 0; i < _scalars.Length; i++)
+                for (int i = 0; i < raw.Length; i++)
                 {
                     ushort id = _grid.ElementIds[i];
                     ElementDef def = id < _grid.ElementDefs.Length ? _grid.ElementDefs[id] : default;
                     float maxMass = def.MaxMass > 0f ? def.MaxMass : 1f;
-                    _scalars[i] = Mathf.Clamp01(_grid.Masses[i] / maxMass);
+                    raw[i] = Mathf.Clamp01(_grid.Masses[i] / maxMass);
                 }
                 break;
-            }
         }
 
-        _texture.SetPixelData(_scalars, 0);
         _texture.Apply(false, false);
 
         if (_material != null)
         {
-            _material.SetFloat("_Mode", overlayMode == SimOverlayMode.Material ? 1f : 0f);
+            _material.SetFloat(ModeId, (float)overlayMode);
+            _material.SetFloat(MinTempKId, ElementRegistry.CelsiusToKelvin(minTempC));
+            _material.SetFloat(MaxTempKId, ElementRegistry.CelsiusToKelvin(maxTempC));
         }
     }
 
     public void Dispose()
     {
-        if (_renderer != null)
-        {
-            Destroy(_renderer.gameObject);
-        }
-
-        if (_mesh != null)
-        {
-            Destroy(_mesh);
-        }
-
-        if (_material != null)
-        {
-            Destroy(_material);
-        }
-
-        if (_texture != null)
-        {
-            Destroy(_texture);
-        }
+        if (_renderer != null) Destroy(_renderer.gameObject);
+        if (_mesh != null) Destroy(_mesh);
+        if (_material != null) Destroy(_material);
+        if (_texture != null) Destroy(_texture);
 
         _grid = null;
-        _scalars = null;
     }
 
     private static Mesh BuildQuad(int width, int height)

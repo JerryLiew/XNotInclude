@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Unity.Jobs;
 using UnityEngine;
 
@@ -8,24 +9,27 @@ public sealed class SimBootstrap : MonoBehaviour
     [SerializeField, Min(4)] private int height = 64;
 
     [Header("Timing")]
-    [SerializeField] private float tickRate = 20f;
+    [SerializeField] private float tickRate = 5f;        // 对齐《缺氧》原版 5Hz (simDt = 0.2s)
     [SerializeField] private float timeScale = 1f;
-    [SerializeField, Range(1, 16)] private int maxTicksPerFrame = 4;
+    [SerializeField, Range(1, 64)] private int maxTicksPerFrame = 8;
     [SerializeField] private bool paused;
 
-    private const int MaxTickBudget = 8192;
+    private const int MaxTickBudget = 4096;
 
     private SimGridData _grid;
     private SimPipeline _pipeline;
     private SimVisualizer _visualizer;
     private JobHandle _simHandle;
     private float _accumulator;
+    private readonly Stopwatch _sw = new Stopwatch();
 
     public SimGridData Grid => _grid;
     public SimVisualizer Visualizer => _visualizer;
     public int TickIndex => _pipeline != null ? _pipeline.TickIndex : 0;
     public float TickRate => tickRate;
+    public float SimDt => 1f / Mathf.Max(0.01f, tickRate);
     public int LastTicksThisFrame { get; private set; }
+    public double LastTickMs { get; private set; }
 
     public float TimeScale
     {
@@ -71,7 +75,7 @@ public sealed class SimBootstrap : MonoBehaviour
 
         _pipeline = new SimPipeline()
             .AddPass(new ThermalConductionPass());
-            // Append new independent passes here, e.g.:
+            // 后续扩展直接追加：
             // .AddPass(new GasDiffusionPass())
             // .AddPass(new LiquidFlowPass())
             // .AddPass(new PhaseChangePass());
@@ -93,22 +97,22 @@ public sealed class SimBootstrap : MonoBehaviour
 
     private void SetupCamera()
     {
-        Camera camera = Camera.main;
-        if (camera == null)
+        Camera cam = Camera.main;
+        if (cam == null)
         {
             var cameraObject = new GameObject("SimCamera");
             cameraObject.tag = "MainCamera";
-            camera = cameraObject.AddComponent<Camera>();
+            cam = cameraObject.AddComponent<Camera>();
         }
 
-        camera.orthographic = true;
-        camera.transform.position = new Vector3(0f, 0f, -10f);
-        camera.transform.rotation = Quaternion.identity;
-        camera.nearClipPlane = 0.1f;
-        camera.farClipPlane = 100f;
-        camera.orthographicSize = Mathf.Max(
+        cam.orthographic = true;
+        cam.transform.position = new Vector3(0f, 0f, -10f);
+        cam.transform.rotation = Quaternion.identity;
+        cam.nearClipPlane = 0.1f;
+        cam.farClipPlane = 100f;
+        cam.orthographicSize = Mathf.Max(
             height * 0.5f,
-            width * 0.5f / Mathf.Max(0.1f, camera.aspect)) * 1.02f;
+            width * 0.5f / Mathf.Max(0.1f, cam.aspect)) * 1.02f;
     }
 
     private void Update()
@@ -120,21 +124,32 @@ public sealed class SimBootstrap : MonoBehaviour
             return;
         }
 
-        float dt = 1f / EffectiveTickRate;
+        // 固定物理步长 simDt，通过 timeScale 加速时间累积，保证真变速与确定性
+        float simDt = SimDt;
         int tickBudget = Mathf.Clamp(Mathf.CeilToInt(maxTicksPerFrame * timeScale), 1, MaxTickBudget);
-        _accumulator += Mathf.Min(Time.deltaTime, dt * tickBudget);
+        _accumulator += Mathf.Min(Time.deltaTime * timeScale, simDt * tickBudget);
 
-        while (_accumulator >= dt && LastTicksThisFrame < tickBudget)
+        if (_accumulator >= simDt)
         {
-            _simHandle = _pipeline.Step(_grid, dt, _simHandle);
-            _accumulator -= dt;
-            LastTicksThisFrame++;
+            _sw.Restart();
+            while (_accumulator >= simDt && LastTicksThisFrame < tickBudget)
+            {
+                _simHandle = _pipeline.Step(_grid, simDt, _simHandle);
+                _accumulator -= simDt;
+                LastTicksThisFrame++;
+            }
         }
     }
 
     private void LateUpdate()
     {
         _simHandle.Complete();
+        if (LastTicksThisFrame > 0)
+        {
+            _sw.Stop();
+            LastTickMs = _sw.Elapsed.TotalMilliseconds / LastTicksThisFrame;
+        }
+
         _visualizer?.Refresh();
     }
 
@@ -145,7 +160,10 @@ public sealed class SimBootstrap : MonoBehaviour
         _grid?.Dispose();
     }
 
-    public void Paint(int centerX, int centerY, float radius, ushort elementId, float mass, float temperature)
+    /// <summary>
+    /// 绘制材质，temperatureK 单位为开尔文 (K)。真空会自动归零质量与温度。
+    /// </summary>
+    public void Paint(int centerX, int centerY, float radius, ushort elementId, float mass, float temperatureK)
     {
         if (_grid == null || elementId >= _grid.ElementDefs.Length)
         {
@@ -153,6 +171,10 @@ public sealed class SimBootstrap : MonoBehaviour
         }
 
         _simHandle.Complete();
+
+        bool isVacuum = elementId == ElementIds.Vacuum;
+        float finalMass = isVacuum ? 0f : Mathf.Max(0f, mass);
+        float finalTempK = isVacuum ? 0f : Mathf.Clamp(temperatureK, 1f, 10000f);
 
         int reach = Mathf.Max(0, Mathf.CeilToInt(radius));
         float radiusSq = radius * radius + 0.25f;
@@ -175,8 +197,8 @@ public sealed class SimBootstrap : MonoBehaviour
 
                 int index = _grid.ToIndex(x, y);
                 _grid.ElementIds[index] = elementId;
-                _grid.Masses[index] = Mathf.Max(0f, mass);
-                _grid.Temperatures[index] = temperature;
+                _grid.Masses[index] = finalMass;
+                _grid.Temperatures[index] = finalTempK;
             }
         }
     }
