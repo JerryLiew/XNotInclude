@@ -61,6 +61,19 @@ public static class SimSceneInitializer
                 }
             }
         }
+
+        // 顶部偏左放置一小团二氧化碳（35°C），用于直观验证重力下沉分层与横向摊平
+        int co2Top = grid.Height - 3;
+        int co2Bottom = Mathf.Max(airBottom + 1, co2Top - 3);
+        int co2Left = Mathf.Max(airLeft + 1, grid.Width / 2 - 5);
+        int co2Right = Mathf.Min(airRight - 1, co2Left + 8);
+        for (int y = co2Bottom; y <= co2Top; y++)
+        {
+            for (int x = co2Left; x <= co2Right; x++)
+            {
+                SetCellCelsius(grid, x, y, ElementIds.CarbonDioxide, 35f);
+            }
+        }
     }
 
     private static void SetCellCelsius(SimGridData grid, int x, int y, ushort elementId, float tempCelsius)

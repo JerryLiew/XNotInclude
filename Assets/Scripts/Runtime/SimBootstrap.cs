@@ -74,9 +74,9 @@ public sealed class SimBootstrap : MonoBehaviour
         SimSceneInitializer.Apply(_grid);
 
         _pipeline = new SimPipeline()
-            .AddPass(new ThermalConductionPass());
+            .AddPass(new ThermalConductionPass())
+            .AddPass(new GasDiffusionPass());
             // 后续扩展直接追加：
-            // .AddPass(new GasDiffusionPass())
             // .AddPass(new LiquidFlowPass())
             // .AddPass(new PhaseChangePass());
 
